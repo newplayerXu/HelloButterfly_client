@@ -1,0 +1,20 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPathWin": "f:\\ESP-IDF\\v5.5.2\\esp-idf",
+  "idf.pythonInstallPath": "F:\\ESP-IDF\\Espressif\\tools\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.portWin": "COM3",
+  "idf.toolsPathWin": "F:\\ESP-IDF\\Espressif\\tools",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "F:\\ESP-IDF\\Espressif\\tools\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=g:\\Code\\Demo-esp\\Tasks\\EspidfTasks\\Try_temp\\v1client\\build"
+  ],
+  "idf.flashType": "JTAG"
+}
