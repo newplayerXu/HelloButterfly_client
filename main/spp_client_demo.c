@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "driver/uart.h"
 
 #include "esp_bt.h"
@@ -28,6 +29,211 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "esp_timer.h"
+
+#define DEBUG
+/*--------------------------------------*/
+#include "MT6816.h"
+
+#define MT6816_CS1_PIN GPIO_NUM_15
+#define MT6816_CS2_PIN GPIO_NUM_6
+#define MT6816_CS3_PIN GPIO_NUM_17
+#define MT6816_CS4_PIN GPIO_NUM_8
+
+#define MT6816_MISO_PIN GPIO_NUM_18
+#define MT6816_MOSI_PIN GPIO_NUM_5
+#define MT6816_SCK_PIN GPIO_NUM_7
+/*--------------------------------------*/
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+
+#define _1_PWMA GPIO_NUM_10
+#define _1_AIN2 GPIO_NUM_11
+#define _1_AIN1 GPIO_NUM_12
+#define _1_PWMB GPIO_NUM_3
+#define _1_BIN2 GPIO_NUM_46
+#define _1_BIN1 GPIO_NUM_9
+
+#define _2_PWMA GPIO_NUM_13
+#define _2_AIN2 GPIO_NUM_14
+#define _2_AIN1 GPIO_NUM_21
+#define _2_PWMB GPIO_NUM_45
+#define _2_BIN2 GPIO_NUM_48
+#define _2_BIN1 GPIO_NUM_47
+
+//------------------------------电机引脚配置------------------------------//
+void gpio_init(void)
+{
+    // gpio_set_direction(_1_PWMA, GPIO_MODE_OUTPUT);//配置左侧两电机为输出模式
+    // gpio_set_direction(_1_PWMB, GPIO_MODE_OUTPUT);
+    gpio_set_direction(_1_AIN2, GPIO_MODE_OUTPUT);
+    gpio_set_direction(_1_AIN1, GPIO_MODE_OUTPUT);
+    gpio_set_direction(_1_BIN2, GPIO_MODE_OUTPUT);
+    gpio_set_direction(_1_BIN1, GPIO_MODE_OUTPUT);
+
+    // gpio_set_direction(_2_PWMA, GPIO_MODE_OUTPUT);//配置右侧两电机为输出模式
+    // gpio_set_direction(_2_PWMB, GPIO_MODE_OUTPUT);
+    gpio_set_direction(_2_AIN2, GPIO_MODE_OUTPUT);
+    gpio_set_direction(_2_AIN1, GPIO_MODE_OUTPUT);
+    gpio_set_direction(_2_BIN2, GPIO_MODE_OUTPUT);
+    gpio_set_direction(_2_BIN1, GPIO_MODE_OUTPUT);
+
+    //------------------------------配置定时器和通道------------------------------//
+    gpio_config_t motor_cfg = {
+        //.pin_bit_mask = (1ULL << _2A_LED_GPIO),
+        .pin_bit_mask = (1ULL << _1_PWMA) | (1ULL << _1_PWMB) |
+                        (1ULL << _2_PWMA) | (1ULL << _2_PWMB) |
+                        (1ULL << _1_AIN2) | (1ULL << _1_AIN1) |
+                        (1ULL << _1_BIN2) | (1ULL << _1_BIN1) |
+                        (1ULL << _2_AIN2) | (1ULL << _2_AIN1) |
+                        (1ULL << _2_BIN2) | (1ULL << _2_BIN1),
+
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&motor_cfg);
+
+    ledc_timer_config_t motor_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = LEDC_TIMER_0,
+        .clk_cfg = LEDC_AUTO_CLK,
+        .freq_hz = 500,
+        .duty_resolution = LEDC_TIMER_13_BIT,
+
+    };
+    ledc_timer_config(&motor_timer);
+    // 配置4个独立的PWM通道
+    // 通道0: 左侧A电机
+    ledc_channel_config_t channel_0 = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .gpio_num = _1_PWMA,
+        .duty = 0,
+        .intr_type = LEDC_INTR_DISABLE,
+    };
+    ledc_channel_config(&channel_0);
+    // 通道1: 左侧B电机
+    ledc_channel_config_t channel_1 = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_1,
+        .timer_sel = LEDC_TIMER_0,
+        .gpio_num = _1_PWMB,
+        .duty = 0,
+        .intr_type = LEDC_INTR_DISABLE,
+    };
+    ledc_channel_config(&channel_1);
+
+    // 通道2: 右侧A电机
+    ledc_channel_config_t channel_2 = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_2,
+        .timer_sel = LEDC_TIMER_0,
+        .gpio_num = _2_PWMA,
+        .duty = 0,
+        .intr_type = LEDC_INTR_DISABLE,
+    };
+    ledc_channel_config(&channel_2);
+
+    // 通道3: 右侧B电机
+    ledc_channel_config_t channel_3 = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_3,
+        .timer_sel = LEDC_TIMER_0,
+        .gpio_num = _2_PWMB,
+        .duty = 0,
+        .intr_type = LEDC_INTR_DISABLE,
+    };
+    ledc_channel_config(&channel_3);
+
+    // ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 2192); // 25%初始占空比
+    // ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+
+    ledc_fade_func_install(0); // 开启硬件pwm
+}
+//------------------------------电机控制逻辑------------------------------//
+void motor_speed_lr(uint8_t lr, uint8_t motor, uint32_t speed, uint8_t dir)
+// lr:1-左侧，2-右侧 motor:
+// motor:1-A电机，2-B电机；
+// speed：0-8191
+// dir:1-正转，2-反转
+{
+    ledc_channel_t channel=0;
+
+    if (lr == 1)
+    { // 左侧
+        channel = (motor == 1) ? LEDC_CHANNEL_0 : LEDC_CHANNEL_1;
+    }
+    else if(lr == 2)
+    { // 右侧
+        channel = (motor == 1) ? LEDC_CHANNEL_2 : LEDC_CHANNEL_3;
+    }
+    if (lr == 1)
+    {
+        if (motor == 1)
+        {
+            if (dir == 1)
+            {
+                gpio_set_level(_1_AIN2, 1);
+                gpio_set_level(_1_AIN1, 0);
+            }
+            else if(dir == 2)
+            {
+                gpio_set_level(_1_AIN2, 0);
+                gpio_set_level(_1_AIN1, 1);
+            }
+        }
+        else if (motor == 2)
+        {
+            if (dir == 1)
+            {
+                gpio_set_level(_1_BIN2, 1);
+                gpio_set_level(_1_BIN1, 0);
+            }
+            else if(dir == 2)
+            {
+                gpio_set_level(_1_BIN2, 0);
+                gpio_set_level(_1_BIN1, 1);
+            }
+        }
+    }else if (lr == 2)
+    {
+        if (motor == 1)
+        {
+            if (dir == 1)
+            {
+                gpio_set_level(_2_AIN2, 1);
+                gpio_set_level(_2_AIN1, 0);
+            }
+            else if(dir == 2)
+            {
+                gpio_set_level(_2_AIN2, 0);
+                gpio_set_level(_2_AIN1, 1);
+            }
+        }
+        else if (motor == 2)
+        {
+            if (dir == 1)
+            {
+                gpio_set_level(_2_BIN2, 1);
+                gpio_set_level(_2_BIN1, 0);
+            }
+            else if(dir == 2)
+            {
+                gpio_set_level(_2_BIN2, 0);
+                gpio_set_level(_2_BIN1, 1);
+            }
+        }
+    }
+    if(speed > 8191)
+    {
+        speed = 8191;
+    }
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, channel, speed);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);
+    // ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
 
 #define GATTC_TAG                   "GATTC_SPP_DEMO"
 #define PROFILE_NUM                 1
@@ -115,6 +321,42 @@ static uint64_t notify_len = 0;
 static uint64_t start_time = 0;
 static uint64_t current_time = 0;
 
+/*-----------------------------------------------*/
+#define RC_FRAME_HEADER                  0xA5
+#define RC_FRAME_TAIL                    0x5A
+#define RC_FRAME_LEN                     11
+#define RC_NOTIFY_MAX_LEN                32
+#define RC_RX_QUEUE_LEN                  16
+#define RC_CTRL_QUEUE_LEN                1
+#define RC_LINK_TIMEOUT_US               (300000)
+#define RC_NEUTRAL_US                    1500
+#define RC_HALF_RANGE_US                 500
+#define MOTOR_PWM_MAX_DUTY               8191
+#define RC_DEBUG_LOG_RAW                 1
+#define ANGLE_CTRL_KP_DUTY_PER_DEG       45.0f
+#define ANGLE_CTRL_DEADBAND_DEG          1.5f
+#define ANGLE_CTRL_LOG_PERIOD_US         (200000)
+
+typedef struct {
+    uint16_t len;
+    uint8_t data[RC_NOTIFY_MAX_LEN];
+} rc_rx_packet_t;
+
+typedef struct {
+    uint8_t seq;
+    uint16_t ch1;
+    uint16_t ch2;
+    uint16_t ch3;
+    uint8_t flags;
+    uint64_t rx_timestamp_us;
+} rc_cmd_t;
+
+static QueueHandle_t rc_rx_queue = NULL;
+static QueueHandle_t rc_ctrl_queue = NULL;
+static uint64_t g_last_rx_us = 0;
+static bool g_mt6816_ready = false;
+
+/*-----------------------------------------------*/
 #ifdef SUPPORT_HEARTBEAT
 static uint8_t  heartbeat_s[9] = {'E','s','p','r','e','s','s','i','f'};
 static QueueHandle_t cmd_heartbeat_queue = NULL;
@@ -125,6 +367,210 @@ static esp_bt_uuid_t spp_service_uuid = {
     .uuid = {.uuid16 = ESP_GATT_SPP_SERVICE_UUID,},
 };
 
+/*-----------------------------------------------*/
+static uint8_t rc_crc8(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+static void motor_stop_all(void)
+{
+    motor_speed_lr(1, 1, 0, 1);
+    motor_speed_lr(1, 2, 0, 1);
+    motor_speed_lr(2, 1, 0, 1);
+    motor_speed_lr(2, 2, 0, 1);
+}
+
+static inline int16_t rc_centered(uint16_t ch)
+{
+    int32_t v = (int32_t)ch - RC_NEUTRAL_US;
+    if (v > RC_HALF_RANGE_US) {
+        v = RC_HALF_RANGE_US;
+    } else if (v < -RC_HALF_RANGE_US) {
+        v = -RC_HALF_RANGE_US;
+    }
+    return (int16_t)v;
+}
+
+static uint32_t rc_to_pwm(int16_t v)
+{
+    uint32_t mag = (uint32_t)(v >= 0 ? v : -v);
+    return (mag * MOTOR_PWM_MAX_DUTY) / RC_HALF_RANGE_US;
+}
+
+static float rc_ch_to_target_deg(uint16_t ch)
+{
+    if (ch < 1000) {
+        ch = 1000;
+    } else if (ch > 2000) {
+        ch = 2000;
+    }
+    return ((float)(ch - 1000) * 360.0f) / 1000.0f;
+}
+
+static float angle_error_deg(float target_deg, float current_deg)
+{
+    float err = target_deg - current_deg;
+    while (err > 180.0f) {
+        err -= 360.0f;
+    }
+    while (err < -180.0f) {
+        err += 360.0f;
+    }
+    return err;
+}
+
+static bool enqueue_notify_packet(const uint8_t *data, uint16_t len)
+{
+    if (rc_rx_queue == NULL || data == NULL || len == 0 || len > RC_NOTIFY_MAX_LEN) {
+        #ifdef DEBUG    
+        ESP_LOGW(GATTC_TAG, "Drop notify packet, queue=%p len=%u", rc_rx_queue, len);
+        #endif
+        return false;
+    }
+
+    rc_rx_packet_t pkt = {
+        .len = len,
+    };
+    memcpy(pkt.data, data, len);
+
+#if RC_DEBUG_LOG_RAW
+    ESP_LOGI(GATTC_TAG, "RX notify len=%u", len);
+    ESP_LOG_BUFFER_HEX_LEVEL(GATTC_TAG, pkt.data, len, ESP_LOG_INFO);
+#endif
+
+    g_last_rx_us = esp_timer_get_time();
+    if (xQueueSend(rc_rx_queue, &pkt, 0) == pdPASS) {
+        return true;
+    }
+
+    rc_rx_packet_t drop_pkt;
+    (void)xQueueReceive(rc_rx_queue, &drop_pkt, 0);
+    return xQueueSend(rc_rx_queue, &pkt, 0) == pdPASS;
+}
+
+static bool parse_rc_frame(const uint8_t *buf, uint16_t len, rc_cmd_t *cmd)
+{
+    if (buf == NULL || cmd == NULL || len != RC_FRAME_LEN) {
+        #ifdef DEBUG
+        ESP_LOGW(GATTC_TAG, "Invalid RC frame len=%u", len);
+        #endif
+        return false;
+    }
+    if (buf[0] != RC_FRAME_HEADER || buf[10] != RC_FRAME_TAIL) {
+        #ifdef DEBUG
+        ESP_LOGW(GATTC_TAG, "Invalid RC frame header/tail: %02X ... %02X", buf[0], buf[10]);
+        #endif
+        return false;
+    }
+
+    const uint8_t calc_crc = rc_crc8(&buf[1], 7);
+    if (calc_crc != buf[8]) {
+        #ifdef DEBUG
+        ESP_LOGW(GATTC_TAG, "Invalid RC frame crc calc=%02X recv=%02X", calc_crc, buf[8]);
+        #endif
+        return false;
+    }
+
+    cmd->seq = buf[1];
+    cmd->ch1 = (uint16_t)(buf[2] | (buf[3] << 8));
+    cmd->ch2 = (uint16_t)(buf[4] | (buf[5] << 8));
+    cmd->ch3 = (uint16_t)(buf[6] | (buf[7] << 8));
+    cmd->flags = buf[9];
+    cmd->rx_timestamp_us = esp_timer_get_time();
+    return true;
+}
+
+static void rc_parse_task(void *arg)
+{
+    rc_rx_packet_t pkt;
+    rc_cmd_t cmd;
+
+    for (;;) {
+        if (xQueueReceive(rc_rx_queue, &pkt, portMAX_DELAY) != pdPASS) {
+            continue;
+        }
+        if (!parse_rc_frame(pkt.data, pkt.len, &cmd)) {
+            continue;
+        }
+
+        ESP_LOGI(GATTC_TAG, "RC seq=%u ch1=%u ch2=%u ch3=%u flags=0x%02X",
+                 cmd.seq, cmd.ch1, cmd.ch2, cmd.ch3, cmd.flags);
+
+        (void)xQueueOverwrite(rc_ctrl_queue, &cmd);
+    }
+}
+
+static void rc_control_task(void *arg)
+{
+    rc_cmd_t cmd = {0};
+    const TickType_t loop_ticks = pdMS_TO_TICKS(10);
+    uint64_t last_log_us = 0;
+
+    for (;;) {
+        (void)xQueueReceive(rc_ctrl_queue, &cmd, 0);
+
+        const uint64_t now_us = esp_timer_get_time();
+        if ((now_us - g_last_rx_us) > RC_LINK_TIMEOUT_US) {
+            motor_stop_all();
+            vTaskDelay(loop_ticks);
+            continue;
+        }
+
+        if (!g_mt6816_ready) {
+            motor_stop_all();
+            vTaskDelay(loop_ticks);
+            continue;
+        }
+
+        float current_deg = 0.0f;
+        esp_err_t angle_err = mt6816_read_angle_deg(&enc, &current_deg);
+        if (angle_err != ESP_OK) {
+            ESP_LOGW(GATTC_TAG, "MT6816 read failed: %s", esp_err_to_name(angle_err));
+            motor_stop_all();
+            vTaskDelay(loop_ticks);
+            continue;
+        }
+
+        const float target_deg = rc_ch_to_target_deg(cmd.ch1);
+        const float err_deg = angle_error_deg(target_deg, current_deg);
+        const float abs_err_deg = (err_deg >= 0.0f) ? err_deg : -err_deg;
+
+        uint32_t pwm = 0;
+        uint8_t dir = 1;
+        if (abs_err_deg >= ANGLE_CTRL_DEADBAND_DEG) {
+            float duty_f = abs_err_deg * ANGLE_CTRL_KP_DUTY_PER_DEG;
+            if (duty_f > (float)MOTOR_PWM_MAX_DUTY) {
+                duty_f = (float)MOTOR_PWM_MAX_DUTY;
+            }
+            pwm = (uint32_t)duty_f;
+            dir = (err_deg >= 0.0f) ? 1 : 2;
+        }
+
+        motor_speed_lr(1, 1, pwm, dir);
+        motor_speed_lr(1, 2, pwm, dir);
+        motor_speed_lr(2, 1, pwm, dir);
+        motor_speed_lr(2, 2, pwm, dir);
+
+        uint64_t now_us = esp_timer_get_time();
+        if ((now_us - last_log_us) >= ANGLE_CTRL_LOG_PERIOD_US) {
+            last_log_us = now_us;
+            ESP_LOGI(GATTC_TAG, "ANGLE target=%.2f current=%.2f err=%.2f pwm=%u dir=%u",
+                     target_deg, current_deg, err_deg, pwm, dir);
+        }
+
+        vTaskDelay(loop_ticks);
+    }
+}
+
+/*-----------------------------------------------*/
 static void notify_event_handler(esp_ble_gattc_cb_param_t * p_data)
 {
     uint8_t handle = 0;
@@ -136,7 +582,20 @@ static void notify_event_handler(esp_ble_gattc_cb_param_t * p_data)
     }
 
     if (handle == db[SPP_IDX_SPP_DATA_NTY_VAL].attribute_handle) {
+        /*------------------------------------*/
+          if (p_data->notify.value_len == 0) {
+            return;
+        }
+        /*------------------------------------*/
         if ((p_data->notify.value[0] == '#') && (p_data->notify.value[1] == '#')) {
+            /*--------------------------------------------------*/
+            if (p_data->notify.value_len < 4) {
+                #ifdef DEBUG
+                ESP_LOGW(GATTC_TAG, "Fragment frame too short");
+                #endif
+                return;
+            }
+            /*--------------------------------------------------*/
             if ((++notify_value_count) != p_data->notify.value[3]) {
                 if(notify_value_p != NULL){
                     free(notify_value_p);
@@ -144,19 +603,27 @@ static void notify_event_handler(esp_ble_gattc_cb_param_t * p_data)
                 notify_value_count = 0;
                 notify_value_p = NULL;
                 notify_value_offset = 0;
+                #ifdef DEBUG
                 ESP_LOGE(GATTC_TAG,"notify value count is not continuous, %s", __func__);
+                #endif
                 return;
             }
             if (p_data->notify.value[3] == 1) {
                 notify_value_p = (char *)malloc(((spp_mtu_size-7)*(p_data->notify.value[2]))*sizeof(char));
                 if (notify_value_p == NULL) {
+                    #ifdef DEBUG
                     ESP_LOGE(GATTC_TAG, "malloc failed, %s L#%d", __func__, __LINE__);
+                    #endif
                     notify_value_count = 0;
                     return;
                 }
                 memcpy((notify_value_p + notify_value_offset), (p_data->notify.value + 4), (p_data->notify.value_len - 4));
                 if (p_data->notify.value[2] == p_data->notify.value[3]) {
-                    uart_write_bytes(UART_NUM_0, (char *)(notify_value_p), (p_data->notify.value_len - 4 + notify_value_offset));
+                    //uart_write_bytes(UART_NUM_0, (char *)(notify_value_p), (p_data->notify.value_len - 4 + notify_value_offset));
+                    /*-----------------------------------------------------------------------------------------*/
+                    const uint16_t payload_len = (uint16_t)(p_data->notify.value_len - 4 + notify_value_offset);
+                    (void)enqueue_notify_packet((uint8_t *)notify_value_p, payload_len);
+                    /*-----------------------------------------------------------------------------------------*/
                     free(notify_value_p);
                     notify_value_p = NULL;
                     notify_value_offset = 0;
@@ -166,7 +633,11 @@ static void notify_event_handler(esp_ble_gattc_cb_param_t * p_data)
             } else if (p_data->notify.value[3] <= p_data->notify.value[2]) {
                 memcpy((notify_value_p + notify_value_offset), (p_data->notify.value + 4), (p_data->notify.value_len - 4));
                 if (p_data->notify.value[3] == p_data->notify.value[2]) {
-                    uart_write_bytes(UART_NUM_0, (char *)(notify_value_p), (p_data->notify.value_len - 4 + notify_value_offset));
+                    //uart_write_bytes(UART_NUM_0, (char *)(notify_value_p), (p_data->notify.value_len - 4 + notify_value_offset));
+                    /*-----------------------------------------------------------------------------------------*/
+                    const uint16_t payload_len = (uint16_t)(p_data->notify.value_len - 4 + notify_value_offset);
+                    (void)enqueue_notify_packet((uint8_t *)notify_value_p, payload_len);
+                   /*------------------------------------------------------------------------------------------*/
                     free(notify_value_p);
                     notify_value_count = 0;
                     notify_value_p = NULL;
@@ -176,8 +647,11 @@ static void notify_event_handler(esp_ble_gattc_cb_param_t * p_data)
                 notify_value_offset += (p_data->notify.value_len - 4);
             }
         } else {
-            uart_write_bytes(UART_NUM_0, (char *)(p_data->notify.value), p_data->notify.value_len);
-        }
+            // uart_write_bytes(UART_NUM_0, (char *)(p_data->notify.value), p_data->notify.value_len);
+            /*-----------------------------------------------------------------------------------------*/
+            (void)enqueue_notify_packet(p_data->notify.value, p_data->notify.value_len);
+            /*-----------------------------------------------------------------------------------------*/
+        }   
     } else if (handle == ((db+SPP_IDX_SPP_STATUS_VAL)->attribute_handle)) {
         ESP_LOG_BUFFER_CHAR(GATTC_TAG, (char *)p_data->notify.value, p_data->notify.value_len);
         //TODO:server notify status characteristic
@@ -199,6 +673,7 @@ static void free_gattc_srv_db(void)
     notify_value_p = NULL;
     notify_value_offset = 0;
     notify_value_count = 0;
+    g_last_rx_us = 0;
     if (db) {
         free(db);
         db = NULL;
@@ -572,11 +1047,11 @@ void ble_client_appRegister(void)
         ESP_LOGE(GATTC_TAG, "set local  MTU failed: %s", esp_err_to_name_r(local_mtu_ret, err_msg, sizeof(err_msg)));
     }
 
-    cmd_reg_queue = xQueueCreate(10, sizeof(uint32_t));
+    cmd_reg_queue = xQueueCreate(10, sizeof(uint16_t));
     xTaskCreate(spp_client_reg_task, "spp_client_reg_task", 2048, NULL, 10, NULL);
 
 #ifdef SUPPORT_HEARTBEAT
-    cmd_heartbeat_queue = xQueueCreate(10, sizeof(uint32_t));
+    cmd_heartbeat_queue = xQueueCreate(10, sizeof(uint16_t));
     xTaskCreate(spp_heart_beat_task, "spp_heart_beat_task", 2048, NULL, 10, NULL);
 #endif
     esp_ble_gattc_app_register(PROFILE_APP_ID);
@@ -662,6 +1137,35 @@ static void spp_uart_init(void)
 void app_main(void)
 {
     esp_err_t ret;
+    /*-----------------------------------------------------------------*/
+    gpio_init();
+    motor_stop_all();
+
+#ifdef MT6816_ON
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    ret = mt6816_init(&enc, SPI2_HOST, PIN_NUM_CS, 100 * 1000);
+    if (ret == ESP_OK) {
+        g_mt6816_ready = true;
+        ESP_LOGI(GATTC_TAG, "MT6816 init OK");
+    } else {
+        ESP_LOGE(GATTC_TAG, "MT6816 init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+#else
+    ESP_LOGW(GATTC_TAG, "MT6816_ON not defined, angle closed-loop disabled");
+#endif
+
+    rc_rx_queue = xQueueCreate(RC_RX_QUEUE_LEN, sizeof(rc_rx_packet_t));
+    rc_ctrl_queue = xQueueCreate(RC_CTRL_QUEUE_LEN, sizeof(rc_cmd_t));
+    if (rc_rx_queue == NULL || rc_ctrl_queue == NULL) {
+        ESP_LOGE(GATTC_TAG, "Create RC queues failed");
+        return;
+    }
+    g_last_rx_us = esp_timer_get_time();
+
+    xTaskCreate(rc_parse_task, "rc_parse_task", 3072, NULL, 9, NULL);
+    xTaskCreate(rc_control_task, "rc_ctrl_task", 2048, NULL, 8, NULL);
+    /*------------------------------------------------------------------*/
 
     spp_uart_init();
 
@@ -695,6 +1199,5 @@ void app_main(void)
         ESP_LOGE(GATTC_TAG, "%s enable bluetooth failed: %s", __func__, esp_err_to_name(ret));
         return;
     }
-
     ble_client_appRegister();
 }
