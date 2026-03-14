@@ -29,25 +29,62 @@ static void mt6816_log_idle_levels(int active_cs_gpio)
         // ESP_LOGW(TAG, "CS GPIO not configured yet");
         return;
     }
-
-    int cs = gpio_get_level((gpio_num_t)active_cs_gpio);
+    #ifdef DEBUG
+    int cs1 = gpio_get_level((gpio_num_t)active_cs_gpio);
     int cs2 = gpio_get_level((gpio_num_t)PIN_NUM_CS2);
     int sclk = gpio_get_level((gpio_num_t)PIN_NUM_CLK);
     int mosi = gpio_get_level((gpio_num_t)PIN_NUM_MOSI);
     int miso = gpio_get_level((gpio_num_t)PIN_NUM_MISO);
-
+    #endif
     // ESP_LOGI(TAG, "Idle levels: CS(%d)=%d CS2(%d)=%d SCLK=%d MOSI=%d MISO=%d",
     //          active_cs_gpio, cs, PIN_NUM_CS2, cs2, sclk, mosi, miso);
 }
 
 static inline void mt6816_set_other_cs_high(int active_cs_gpio)
 {
-    if (PIN_NUM_CS >= 0 && PIN_NUM_CS != active_cs_gpio) {
-        gpio_set_level((gpio_num_t)PIN_NUM_CS, 1);
+    if (PIN_NUM_CS1 >= 0 && PIN_NUM_CS1 != active_cs_gpio) {
+        gpio_set_level((gpio_num_t)PIN_NUM_CS1, 1);
     }
     if (PIN_NUM_CS2 >= 0 && PIN_NUM_CS2 != active_cs_gpio) {
         gpio_set_level((gpio_num_t)PIN_NUM_CS2, 1);
     }
+    if (PIN_NUM_CS3 >= 0 && PIN_NUM_CS3 != active_cs_gpio) {
+        gpio_set_level((gpio_num_t)PIN_NUM_CS3, 1);
+    }
+    if (PIN_NUM_CS4 >= 0 && PIN_NUM_CS4 != active_cs_gpio) {
+        gpio_set_level((gpio_num_t)PIN_NUM_CS4, 1);
+    }
+}
+
+static inline int mt6816_cs_from_index(int dev_index)
+{
+    switch (dev_index) {
+    case 1:
+        return PIN_NUM_CS1;
+    case 2:
+        return PIN_NUM_CS2;
+    case 3:
+        return PIN_NUM_CS3;
+    case 4:
+        return PIN_NUM_CS4;
+    default:
+        return -1;
+    }
+}
+
+static inline void mt6816_config_cs_pin(int gpio)
+{
+    if (gpio < 0) return;
+
+    gpio_config_t conf = {
+        .pin_bit_mask = (1ULL << gpio),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&conf));
+    gpio_set_level((gpio_num_t)gpio, 1);
 }
 
 // STM32 working impl: tx word = ((0x80 | addr) << 8) | 0x00
@@ -71,7 +108,10 @@ static inline uint16_t mt6816_make_cmd_read_word(uint8_t addr)
 static esp_err_t mt6816_read_reg8(mt6816_t *dev, uint8_t addr, uint8_t *out)
 {
     if (!dev || !dev->dev || !out) return ESP_ERR_INVALID_ARG;
-    if (dev->cs_gpio < 0) return ESP_ERR_INVALID_STATE;
+    if (dev->cs_gpio < 0) {
+        ESP_LOGW(TAG, "cs_gpio invalid: %d", dev->cs_gpio);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     uint16_t cmd = mt6816_make_cmd_read_word(addr);
     uint8_t tx[2] = {
@@ -113,27 +153,10 @@ esp_err_t mt6816_init(mt6816_t *out, spi_host_device_t host, int cs_gpio, int cl
     if (!out) return ESP_ERR_INVALID_ARG;
 
     out->cs_gpio = cs_gpio;
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << cs_gpio),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io_conf));
-    gpio_set_level((gpio_num_t)cs_gpio, 1);
-
-    if (PIN_NUM_CS2 != cs_gpio) {
-        gpio_config_t cs2_conf = {
-            .pin_bit_mask = (1ULL << PIN_NUM_CS2),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        ESP_ERROR_CHECK(gpio_config(&cs2_conf));
-        gpio_set_level((gpio_num_t)PIN_NUM_CS2, 1);
-    }
+    mt6816_config_cs_pin(PIN_NUM_CS1);
+    mt6816_config_cs_pin(PIN_NUM_CS2);
+    mt6816_config_cs_pin(PIN_NUM_CS3);
+    mt6816_config_cs_pin(PIN_NUM_CS4);
 
     mt6816_set_other_cs_high(cs_gpio);
 
@@ -212,4 +235,20 @@ esp_err_t mt6816_read_angle_deg(mt6816_t *dev, float *angle_deg)
 
     *angle_deg = mt6816_angle14_to_deg(a14);
     return ESP_OK;
+}
+
+esp_err_t mt6816_read_angle_deg_dev(mt6816_t *dev, int dev_index, float *angle_deg)
+{
+    if (!dev || !angle_deg) return ESP_ERR_INVALID_ARG;
+
+    int cs_gpio = mt6816_cs_from_index(dev_index);
+    if (cs_gpio < 0) return ESP_ERR_INVALID_ARG;
+
+    int prev_cs = dev->cs_gpio;
+    dev->cs_gpio = cs_gpio;
+
+    esp_err_t err = mt6816_read_angle_deg(dev, angle_deg);
+
+    dev->cs_gpio = prev_cs;
+    return err;
 }

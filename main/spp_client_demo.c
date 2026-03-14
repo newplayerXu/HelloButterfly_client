@@ -519,22 +519,24 @@ static void rc_control_task(void *arg)
 
         const uint64_t now_us = esp_timer_get_time();
         if ((now_us - g_last_rx_us) > RC_LINK_TIMEOUT_US) {
-            motor_stop_all();
+            //motor_stop_all();
             vTaskDelay(loop_ticks);
             continue;
         }
 
         if (!g_mt6816_ready) {
-            motor_stop_all();
+            //motor_stop_all();
             vTaskDelay(loop_ticks);
             continue;
         }
 
         float current_deg = 0.0f;
-        esp_err_t angle_err = mt6816_read_angle_deg(&enc, &current_deg);
+        esp_err_t angle_err = mt6816_read_angle_deg_dev(&enc,1, &current_deg);
         if (angle_err != ESP_OK) {
+            #ifdef DEBUG
             ESP_LOGW(GATTC_TAG, "MT6816 read failed: %s", esp_err_to_name(angle_err));
-            motor_stop_all();
+            #endif
+            //motor_stop_all();
             vTaskDelay(loop_ticks);
             continue;
         }
@@ -559,13 +561,15 @@ static void rc_control_task(void *arg)
         motor_speed_lr(2, 1, pwm, dir);
         motor_speed_lr(2, 2, pwm, dir);
 
-        uint64_t now_us = esp_timer_get_time();
-        if ((now_us - last_log_us) >= ANGLE_CTRL_LOG_PERIOD_US) {
-            last_log_us = now_us;
+        uint64_t log_now_us = esp_timer_get_time();
+        if ((log_now_us - last_log_us) >= ANGLE_CTRL_LOG_PERIOD_US) {
+            last_log_us = log_now_us;
             ESP_LOGI(GATTC_TAG, "ANGLE target=%.2f current=%.2f err=%.2f pwm=%u dir=%u",
                      target_deg, current_deg, err_deg, pwm, dir);
         }
-
+        #ifdef DEBUG
+        g_last_rx_us = esp_timer_get_time();
+        #endif
         vTaskDelay(loop_ticks);
     }
 }
@@ -1143,7 +1147,7 @@ void app_main(void)
 
 #ifdef MT6816_ON
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    ret = mt6816_init(&enc, SPI2_HOST, PIN_NUM_CS, 100 * 1000);
+    ret = mt6816_init(&enc, SPI2_HOST, MT6816_CS1_PIN, 100 * 1000);
     if (ret == ESP_OK) {
         g_mt6816_ready = true;
         ESP_LOGI(GATTC_TAG, "MT6816 init OK");
@@ -1164,7 +1168,7 @@ void app_main(void)
     g_last_rx_us = esp_timer_get_time();
 
     xTaskCreate(rc_parse_task, "rc_parse_task", 3072, NULL, 9, NULL);
-    xTaskCreate(rc_control_task, "rc_ctrl_task", 2048, NULL, 8, NULL);
+    xTaskCreate(rc_control_task, "rc_ctrl_task", 4096, NULL, 8, NULL); // bumped stack to avoid overflow in angle control loop
     /*------------------------------------------------------------------*/
 
     spp_uart_init();
