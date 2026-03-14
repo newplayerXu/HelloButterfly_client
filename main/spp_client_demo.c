@@ -15,7 +15,12 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "driver/uart.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #include "esp_bt.h"
 #include "nvs_flash.h"
@@ -33,6 +38,8 @@
 #define DEBUG
 /*--------------------------------------*/
 #include "MT6816.h"
+
+#define MT6816_ON
 
 #define MT6816_CS1_PIN GPIO_NUM_15
 #define MT6816_CS2_PIN GPIO_NUM_6
@@ -336,6 +343,37 @@ static uint64_t current_time = 0;
 #define ANGLE_CTRL_KP_DUTY_PER_DEG       45.0f
 #define ANGLE_CTRL_DEADBAND_DEG          1.5f
 #define ANGLE_CTRL_LOG_PERIOD_US         (200000)
+#define MOTOR_COUNT                      4
+
+// Motor index mapping: 0->(lr=1,A), 1->(lr=1,B), 2->(lr=2,A), 3->(lr=2,B)
+static const uint8_t k_motor_lr[MOTOR_COUNT] = {1, 1, 2, 2};
+static const uint8_t k_motor_ab[MOTOR_COUNT] = {1, 2, 1, 2};
+
+// Mix tables: tune signs to match your physical layout (yaw: left/right, pitch: front/back)
+static const float k_motor_yaw_mix[MOTOR_COUNT]   = { 1.0f,  1.0f, -1.0f, -1.0f};
+static const float k_motor_pitch_mix[MOTOR_COUNT] = { 1.0f, -1.0f,  1.0f, -1.0f};
+
+typedef struct {
+    float neutral_deg;          // Base holding angle
+    float fold_deg;             // Wing-fold angle when flags == 0x01
+    float yaw_max_delta_deg;    // Max +/- delta added by ch1
+    float pitch_max_delta_deg;  // Max +/- delta added by ch2
+} rc_angle_cfg_t;
+
+typedef struct {
+    float target_deg;
+    float current_deg;
+    float err_deg;
+} motor_ctrl_state_t;
+
+static rc_angle_cfg_t g_angle_cfg = {
+    .neutral_deg = 0.0f,
+    .fold_deg = 20.0f,
+    .yaw_max_delta_deg = 60.0f,
+    .pitch_max_delta_deg = 60.0f,
+};
+
+static motor_ctrl_state_t g_motors[MOTOR_COUNT] = {0};
 
 typedef struct {
     uint16_t len;
@@ -415,6 +453,16 @@ static float rc_ch_to_target_deg(uint16_t ch)
     return ((float)(ch - 1000) * 360.0f) / 1000.0f;
 }
 
+static float rc_ch_to_norm(uint16_t ch)
+{
+    if (ch < 1000) {
+        ch = 1000;
+    } else if (ch > 2000) {
+        ch = 2000;
+    }
+    return ((float)ch - (float)RC_NEUTRAL_US) / (float)RC_HALF_RANGE_US; // -1..1
+}
+
 static float angle_error_deg(float target_deg, float current_deg)
 {
     float err = target_deg - current_deg;
@@ -425,6 +473,74 @@ static float angle_error_deg(float target_deg, float current_deg)
         err += 360.0f;
     }
     return err;
+}
+
+static inline void motor_apply_pwm_by_index(int motor_idx, uint32_t pwm, uint8_t dir)
+{
+    if (motor_idx < 0 || motor_idx >= MOTOR_COUNT) {
+        return;
+    }
+    uint8_t lr = k_motor_lr[motor_idx];
+    uint8_t ab = k_motor_ab[motor_idx];
+    motor_speed_lr(lr, ab, pwm, dir);
+}
+
+static void rc_build_hold_targets(const rc_cmd_t *cmd, float out_targets[MOTOR_COUNT])
+{
+    if (!cmd || !out_targets) {
+        return;
+    }
+
+    const float yaw_norm = rc_ch_to_norm(cmd->ch1);    // -1..1
+    const float pitch_norm = rc_ch_to_norm(cmd->ch2);  // -1..1
+
+    const float yaw_delta = yaw_norm * g_angle_cfg.yaw_max_delta_deg;
+    const float pitch_delta = pitch_norm * g_angle_cfg.pitch_max_delta_deg;
+
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        out_targets[i] = g_angle_cfg.neutral_deg
+                       + yaw_delta * k_motor_yaw_mix[i]
+                       + pitch_delta * k_motor_pitch_mix[i];
+    }
+}
+
+typedef struct {
+    float center_deg;
+    float amplitude_deg;
+    float yaw_trim_deg;
+    float pitch_trim_deg;
+    float freq_min_hz;
+    float freq_max_hz;
+    float phase_deg[MOTOR_COUNT];
+} flap_cfg_t;
+
+// Helper for future flapping mode; not wired into the control loop yet.
+static void __attribute__((unused)) rc_build_flap_targets(const rc_cmd_t *cmd, const flap_cfg_t *cfg, uint64_t now_us, float out_targets[MOTOR_COUNT])
+{
+    if (!cmd || !cfg || !out_targets) {
+        return;
+    }
+
+    const float yaw = rc_ch_to_norm(cmd->ch1) * cfg->yaw_trim_deg;
+    const float pitch = rc_ch_to_norm(cmd->ch2) * cfg->pitch_trim_deg;
+
+    const float freq_norm = rc_ch_to_norm(cmd->ch3); // -1..1 maps to [freq_min, freq_max]
+    float freq_hz = cfg->freq_min_hz + ((freq_norm * 0.5f) + 0.5f) * (cfg->freq_max_hz - cfg->freq_min_hz);
+    if (freq_hz < cfg->freq_min_hz) {
+        freq_hz = cfg->freq_min_hz;
+    }
+    if (freq_hz > cfg->freq_max_hz) {
+        freq_hz = cfg->freq_max_hz;
+    }
+
+    const float t_sec = (float)now_us / 1000000.0f;
+    const float omega = 2.0f * (float)M_PI * freq_hz;
+
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        const float phase_rad = cfg->phase_deg[i] * ((float)M_PI / 180.0f);
+        const float base = cfg->center_deg + cfg->amplitude_deg * sinf(omega * t_sec + phase_rad);
+        out_targets[i] = base + yaw * k_motor_yaw_mix[i] + pitch * k_motor_pitch_mix[i];
+    }
 }
 
 static bool enqueue_notify_packet(const uint8_t *data, uint16_t len)
@@ -511,65 +627,98 @@ static void rc_parse_task(void *arg)
 static void rc_control_task(void *arg)
 {
     rc_cmd_t cmd = {0};
+    rc_cmd_t active_cmd = {
+        .ch1 = RC_NEUTRAL_US,
+        .ch2 = RC_NEUTRAL_US,
+        .ch3 = RC_NEUTRAL_US,
+        .flags = 0x00,
+        .rx_timestamp_us = 0,
+    };
+
     const TickType_t loop_ticks = pdMS_TO_TICKS(10);
     uint64_t last_log_us = 0;
 
     for (;;) {
-        (void)xQueueReceive(rc_ctrl_queue, &cmd, 0);
+        if (xQueueReceive(rc_ctrl_queue, &cmd, 0) == pdPASS) {
+            active_cmd = cmd;
+        }
 
         const uint64_t now_us = esp_timer_get_time();
-        if ((now_us - g_last_rx_us) > RC_LINK_TIMEOUT_US) {
-            //motor_stop_all();
+        if ((now_us - g_last_rx_us) > RC_LINK_TIMEOUT_US || !g_mt6816_ready) {
+            motor_stop_all();
             vTaskDelay(loop_ticks);
             continue;
         }
 
-        if (!g_mt6816_ready) {
-            //motor_stop_all();
+        float targets[MOTOR_COUNT] = {0};
+        switch (active_cmd.flags) {
+        case 0x00: // idle
+            motor_stop_all();
             vTaskDelay(loop_ticks);
             continue;
-        }
-
-        float current_deg = 0.0f;
-        esp_err_t angle_err = mt6816_read_angle_deg_dev(&enc,1, &current_deg);
-        if (angle_err != ESP_OK) {
-            #ifdef DEBUG
-            ESP_LOGW(GATTC_TAG, "MT6816 read failed: %s", esp_err_to_name(angle_err));
-            #endif
-            //motor_stop_all();
-            vTaskDelay(loop_ticks);
-            continue;
-        }
-
-        const float target_deg = rc_ch_to_target_deg(cmd.ch1);
-        const float err_deg = angle_error_deg(target_deg, current_deg);
-        const float abs_err_deg = (err_deg >= 0.0f) ? err_deg : -err_deg;
-
-        uint32_t pwm = 0;
-        uint8_t dir = 1;
-        if (abs_err_deg >= ANGLE_CTRL_DEADBAND_DEG) {
-            float duty_f = abs_err_deg * ANGLE_CTRL_KP_DUTY_PER_DEG;
-            if (duty_f > (float)MOTOR_PWM_MAX_DUTY) {
-                duty_f = (float)MOTOR_PWM_MAX_DUTY;
+        case 0x01: // fold wings to preset angle
+            for (int i = 0; i < MOTOR_COUNT; i++) {
+                targets[i] = g_angle_cfg.fold_deg;
             }
-            pwm = (uint32_t)duty_f;
-            dir = (err_deg >= 0.0f) ? 1 : 2;
+            break;
+        case 0x03: // RC controlled yaw/pitch hold
+            rc_build_hold_targets(&active_cmd, targets);
+            break;
+        default:
+            motor_stop_all();
+            vTaskDelay(loop_ticks);
+            continue;
         }
 
-        motor_speed_lr(1, 1, pwm, dir);
-        motor_speed_lr(1, 2, pwm, dir);
-        motor_speed_lr(2, 1, pwm, dir);
-        motor_speed_lr(2, 2, pwm, dir);
+        bool read_fail = false;
+        for (int i = 0; i < MOTOR_COUNT; i++) {
+            float current_deg = 0.0f;
+            esp_err_t angle_err = mt6816_read_angle_deg_dev(&enc, i + 1, &current_deg);
+            if (angle_err != ESP_OK) {
+                #ifdef DEBUG
+                ESP_LOGW(GATTC_TAG, "MT6816[%d] read failed: %s", i + 1, esp_err_to_name(angle_err));
+                #endif
+                read_fail = true;
+                continue;
+            }
 
-        uint64_t log_now_us = esp_timer_get_time();
-        if ((log_now_us - last_log_us) >= ANGLE_CTRL_LOG_PERIOD_US) {
-            last_log_us = log_now_us;
-            ESP_LOGI(GATTC_TAG, "ANGLE target=%.2f current=%.2f err=%.2f pwm=%u dir=%u",
-                     target_deg, current_deg, err_deg, pwm, dir);
+            g_motors[i].current_deg = current_deg;
+            g_motors[i].target_deg = targets[i];
+
+            const float err_deg = angle_error_deg(targets[i], current_deg);
+            g_motors[i].err_deg = err_deg;
+            const float abs_err_deg = (err_deg >= 0.0f) ? err_deg : -err_deg;
+
+            uint32_t pwm = 0;
+            uint8_t dir = 1;
+            if (abs_err_deg >= ANGLE_CTRL_DEADBAND_DEG) {
+                float duty_f = abs_err_deg * ANGLE_CTRL_KP_DUTY_PER_DEG;
+                if (duty_f > (float)MOTOR_PWM_MAX_DUTY) {
+                    duty_f = (float)MOTOR_PWM_MAX_DUTY;
+                }
+                pwm = (uint32_t)duty_f;
+                dir = (err_deg >= 0.0f) ? 1 : 2;
+            }
+
+            motor_apply_pwm_by_index(i, pwm, dir);
         }
-        #ifdef DEBUG
-        g_last_rx_us = esp_timer_get_time();
-        #endif
+
+        if (read_fail) {
+            motor_stop_all();
+            vTaskDelay(loop_ticks);
+            continue;
+        }
+
+        if ((now_us - last_log_us) >= ANGLE_CTRL_LOG_PERIOD_US) {
+            last_log_us = now_us;
+            ESP_LOGI(GATTC_TAG,
+                     "ANGLE tgt=[%.1f %.1f %.1f %.1f] cur=[%.1f %.1f %.1f %.1f] err=[%.1f %.1f %.1f %.1f] flags=0x%02X",
+                     g_motors[0].target_deg, g_motors[1].target_deg, g_motors[2].target_deg, g_motors[3].target_deg,
+                     g_motors[0].current_deg, g_motors[1].current_deg, g_motors[2].current_deg, g_motors[3].current_deg,
+                     g_motors[0].err_deg, g_motors[1].err_deg, g_motors[2].err_deg, g_motors[3].err_deg,
+                     active_cmd.flags);
+        }
+
         vTaskDelay(loop_ticks);
     }
 }
