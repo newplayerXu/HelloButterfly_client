@@ -694,6 +694,7 @@ static void motor_pid_move_to_angle(int motor_idx, float target_deg, float curre
 static void encoder_read_task(void *arg)
 {
     const TickType_t delay_ticks = pdMS_TO_TICKS(ENCODER_TASK_PERIOD_MS);
+    uint64_t last_debug_log_us = 0;
 
     for (;;) {
         if (!g_mt6816_ready) {
@@ -716,6 +717,17 @@ static void encoder_read_task(void *arg)
         if (g_encoder_queue != NULL) {
             (void)xQueueOverwrite(g_encoder_queue, &snapshot);
         }
+
+#ifdef DEBUG
+        const uint64_t now_us = snapshot.timestamp_us;
+        if ((now_us - last_debug_log_us) >= 200000) { // 每200ms打印一次
+            last_debug_log_us = now_us;
+            for (int i = 0; i < MOTOR_COUNT; i++) {
+                const bool ok = (snapshot.err[i] == ESP_OK) && !isnan(snapshot.angle_deg[i]);
+                ESP_LOGI(GATTC_TAG, "ENC[%d] read %s angle=%.2f deg", i + 1, ok ? "OK" : esp_err_to_name(snapshot.err[i]), snapshot.angle_deg[i]);
+            }
+        }
+#endif
 
         vTaskDelay(delay_ticks);
     }
