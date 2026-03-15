@@ -336,14 +336,21 @@ static uint64_t current_time = 0;
 #define RC_RX_QUEUE_LEN                  16
 #define RC_CTRL_QUEUE_LEN                1
 #define RC_LINK_TIMEOUT_US               (300000)
-#define RC_NEUTRAL_US                    1500
-#define RC_HALF_RANGE_US                 500
+#define RC_MIN_US                        192
+#define RC_MAX_US                        1792
+#define RC_NEUTRAL_US                    992
+#define RC_HALF_RANGE_US                 800
+#define RC_SPAN_US                       (RC_MAX_US - RC_MIN_US)
 #define MOTOR_PWM_MAX_DUTY               8191
 #define RC_DEBUG_LOG_RAW                 1
 #define ANGLE_CTRL_KP_DUTY_PER_DEG       45.0f
 #define ANGLE_CTRL_DEADBAND_DEG          1.5f
 #define ANGLE_CTRL_LOG_PERIOD_US         (200000)
 #define MOTOR_COUNT                      4
+#define ENCODER_TASK_PERIOD_MS           5
+#define ENCODER_TASK_PRIORITY            13
+#define ENCODER_QUEUE_LEN                1
+#define ENCODER_STALE_TIMEOUT_US         (200000) // encoder data older than 200 ms is considered stale
 
 // Motor index mapping: 0->(lr=1,A), 1->(lr=1,B), 2->(lr=2,A), 3->(lr=2,B)
 static const uint8_t k_motor_lr[MOTOR_COUNT] = {1, 1, 2, 2};
@@ -366,6 +373,24 @@ typedef struct {
     float err_deg;
 } motor_ctrl_state_t;
 
+// 编码器一次采样快照，包含四路角度与时间戳
+typedef struct {
+    float angle_deg[MOTOR_COUNT];
+    esp_err_t err[MOTOR_COUNT];
+    uint64_t timestamp_us;
+} encoder_snapshot_t;
+
+// 简单PID控制器状态，含积分与限幅
+typedef struct {
+    float kp;
+    float ki;
+    float kd;
+    float integral;
+    float prev_err;
+    float out_min;
+    float out_max;
+} pid_ctrl_t;
+
 static rc_angle_cfg_t g_angle_cfg = {
     .neutral_deg = 0.0f,
     .fold_deg = 20.0f,
@@ -374,6 +399,11 @@ static rc_angle_cfg_t g_angle_cfg = {
 };
 
 static motor_ctrl_state_t g_motors[MOTOR_COUNT] = {0};
+static encoder_snapshot_t g_encoder_latest = {0};
+static QueueHandle_t g_encoder_queue = NULL;
+static pid_ctrl_t g_pid[MOTOR_COUNT] = {0};
+static float g_speed_gain_pos[MOTOR_COUNT] = {0}; // per-motor gain when err>=0 (dir=1)
+static float g_speed_gain_neg[MOTOR_COUNT] = {0}; // per-motor gain when err<0  (dir=2)
 
 typedef struct {
     uint16_t len;
@@ -445,20 +475,20 @@ static uint32_t rc_to_pwm(int16_t v)
 
 static float rc_ch_to_target_deg(uint16_t ch)
 {
-    if (ch < 1000) {
-        ch = 1000;
-    } else if (ch > 2000) {
-        ch = 2000;
+    if (ch < RC_MIN_US) {
+        ch = RC_MIN_US;
+    } else if (ch > RC_MAX_US) {
+        ch = RC_MAX_US;
     }
-    return ((float)(ch - 1000) * 360.0f) / 1000.0f;
+    return ((float)(ch - RC_MIN_US) * 360.0f) / (float)RC_SPAN_US;
 }
 
 static float rc_ch_to_norm(uint16_t ch)
 {
-    if (ch < 1000) {
-        ch = 1000;
-    } else if (ch > 2000) {
-        ch = 2000;
+    if (ch < RC_MIN_US) {
+        ch = RC_MIN_US;
+    } else if (ch > RC_MAX_US) {
+        ch = RC_MAX_US;
     }
     return ((float)ch - (float)RC_NEUTRAL_US) / (float)RC_HALF_RANGE_US; // -1..1
 }
@@ -485,6 +515,8 @@ static inline void motor_apply_pwm_by_index(int motor_idx, uint32_t pwm, uint8_t
     motor_speed_lr(lr, ab, pwm, dir);
 }
 
+// 根据遥控指令生成四路目标角度
+// cmd：解析后的遥控帧；out_targets：输出目标角数组(长度4)
 static void rc_build_hold_targets(const rc_cmd_t *cmd, float out_targets[MOTOR_COUNT])
 {
     if (!cmd || !out_targets) {
@@ -540,6 +572,152 @@ static void __attribute__((unused)) rc_build_flap_targets(const rc_cmd_t *cmd, c
         const float phase_rad = cfg->phase_deg[i] * ((float)M_PI / 180.0f);
         const float base = cfg->center_deg + cfg->amplitude_deg * sinf(omega * t_sec + phase_rad);
         out_targets[i] = base + yaw * k_motor_yaw_mix[i] + pitch * k_motor_pitch_mix[i];
+    }
+}
+
+// 初始化PID参数默认值（无输入参数）
+static void pid_init_defaults(void)
+{
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        g_pid[i].kp = 45.0f;
+        g_pid[i].ki = 0.6f;
+        g_pid[i].kd = 2.5f;
+        g_pid[i].integral = 0.0f;
+        g_pid[i].prev_err = 0.0f;
+        g_pid[i].out_min = 120.0f; // small kick to overcome friction
+        g_pid[i].out_max = (float)MOTOR_PWM_MAX_DUTY;
+    }
+}
+
+// 初始化每个电机上下行速度倍率默认值（无输入参数）
+static void speed_profile_init_defaults(void)
+{
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        g_speed_gain_pos[i] = 1.5f; // downward/positive faster
+        g_speed_gain_neg[i] = 0.8f; // upward/negative slower
+    }
+}
+
+// 批量设置所有电机的上下行速度倍率（>0才生效）
+// gain_pos：正误差/向下方向倍率；gain_neg：负误差/向上方向倍率
+void motor_set_speed_profile(float gain_pos, float gain_neg)
+{
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        if (gain_pos > 0.0f) {
+            g_speed_gain_pos[i] = gain_pos;
+        }
+        if (gain_neg > 0.0f) {
+            g_speed_gain_neg[i] = gain_neg;
+        }
+    }
+}
+
+// 针对单个电机设置上下行速度倍率（索引0..3，>0才生效）
+// motor_idx：电机索引0..3；gain_pos：正误差倍率；gain_neg：负误差倍率
+void motor_set_speed_profile_one(int motor_idx, float gain_pos, float gain_neg)
+{
+    if (motor_idx < 0 || motor_idx >= MOTOR_COUNT) {
+        return;
+    }
+    if (gain_pos > 0.0f) {
+        g_speed_gain_pos[motor_idx] = gain_pos;
+    }
+    if (gain_neg > 0.0f) {
+        g_speed_gain_neg[motor_idx] = gain_neg;
+    }
+}
+
+// 单步PID计算
+// pid：控制器状态指针；err_deg：当前角度误差；dt_s：控制周期时间(s)
+static float pid_step(pid_ctrl_t *pid, float err_deg, float dt_s)
+{
+    if (pid == NULL || dt_s <= 0.0f) {
+        return 0.0f;
+    }
+
+    pid->integral += err_deg * dt_s;
+    const float derivative = (err_deg - pid->prev_err) / dt_s;
+    pid->prev_err = err_deg;
+
+    float output = pid->kp * err_deg + pid->ki * pid->integral + pid->kd * derivative;
+
+    if (output > pid->out_max) {
+        output = pid->out_max;
+    } else if (output < -pid->out_max) {
+        output = -pid->out_max;
+    }
+
+    if (pid->out_min > 0.0f) {
+        if (output > 0.0f && output < pid->out_min) {
+            output = pid->out_min;
+        } else if (output < 0.0f && output > -pid->out_min) {
+            output = -pid->out_min;
+        }
+    }
+
+    return output;
+}
+
+// 基于当前误差与方向，使用PID输出并按上下行倍率缩放后驱动目标电机
+// motor_idx：电机索引0..3；target_deg：目标角度；current_deg：当前角度；dt_s：本次控制周期时间(s)
+static void motor_pid_move_to_angle(int motor_idx, float target_deg, float current_deg, float dt_s)
+{
+    if (motor_idx < 0 || motor_idx >= MOTOR_COUNT) {
+        return;
+    }
+
+    const float err_deg = angle_error_deg(target_deg, current_deg);
+
+    g_motors[motor_idx].target_deg = target_deg;
+    g_motors[motor_idx].current_deg = current_deg;
+    g_motors[motor_idx].err_deg = err_deg;
+
+    const float abs_err_deg = fabsf(err_deg);
+    if (abs_err_deg < ANGLE_CTRL_DEADBAND_DEG) {
+        g_pid[motor_idx].prev_err = err_deg;
+        motor_apply_pwm_by_index(motor_idx, 0, 1);
+        return;
+    }
+
+    const float cmd = pid_step(&g_pid[motor_idx], err_deg, dt_s);
+    const float speed_gain = (err_deg >= 0.0f) ? g_speed_gain_pos[motor_idx] : g_speed_gain_neg[motor_idx];
+    float pwm_f = fabsf(cmd * speed_gain);
+    if (pwm_f > (float)MOTOR_PWM_MAX_DUTY) {
+        pwm_f = (float)MOTOR_PWM_MAX_DUTY;
+    }
+    const uint8_t dir = (cmd >= 0.0f) ? 1 : 2;
+    motor_apply_pwm_by_index(motor_idx, (uint32_t)pwm_f, dir);
+}
+
+// 独立的编码器采样任务，周期读取四个MT6816角度并缓存最新快照
+// arg：未使用
+static void encoder_read_task(void *arg)
+{
+    const TickType_t delay_ticks = pdMS_TO_TICKS(ENCODER_TASK_PERIOD_MS);
+
+    for (;;) {
+        if (!g_mt6816_ready) {
+            vTaskDelay(delay_ticks);
+            continue;
+        }
+
+        encoder_snapshot_t snapshot = {
+            .timestamp_us = esp_timer_get_time(),
+        };
+
+        for (int i = 0; i < MOTOR_COUNT; i++) {
+            float angle = 0.0f;
+            esp_err_t err = mt6816_read_angle_deg_dev(&enc, i + 1, &angle);
+            snapshot.err[i] = err;
+            snapshot.angle_deg[i] = (err == ESP_OK) ? angle : NAN;
+        }
+
+        g_encoder_latest = snapshot;
+        if (g_encoder_queue != NULL) {
+            (void)xQueueOverwrite(g_encoder_queue, &snapshot);
+        }
+
+        vTaskDelay(delay_ticks);
     }
 }
 
@@ -636,6 +814,7 @@ static void rc_control_task(void *arg)
     };
 
     const TickType_t loop_ticks = pdMS_TO_TICKS(10);
+    uint64_t last_loop_us = esp_timer_get_time();
     uint64_t last_log_us = 0;
 
     for (;;) {
@@ -643,8 +822,22 @@ static void rc_control_task(void *arg)
             active_cmd = cmd;
         }
 
+        encoder_snapshot_t snapshot = g_encoder_latest;
+        (void)xQueueReceive(g_encoder_queue, &snapshot, 0);
+
         const uint64_t now_us = esp_timer_get_time();
+        float loop_dt_s = (float)(now_us - last_loop_us) / 1000000.0f;
+        last_loop_us = now_us;
+        if (loop_dt_s <= 0.0f) {
+            loop_dt_s = (float)loop_ticks / (float)configTICK_RATE_HZ;
+        }
+
         if ((now_us - g_last_rx_us) > RC_LINK_TIMEOUT_US || !g_mt6816_ready) {
+            motor_stop_all();
+            vTaskDelay(loop_ticks);
+            continue;
+        }
+        if ((now_us - snapshot.timestamp_us) > ENCODER_STALE_TIMEOUT_US) {
             motor_stop_all();
             vTaskDelay(loop_ticks);
             continue;
@@ -661,7 +854,7 @@ static void rc_control_task(void *arg)
                 targets[i] = g_angle_cfg.fold_deg;
             }
             break;
-        case 0x03: // RC controlled yaw/pitch hold
+        case 0x02: // RC controlled yaw/pitch hold
             rc_build_hold_targets(&active_cmd, targets);
             break;
         default:
@@ -672,51 +865,27 @@ static void rc_control_task(void *arg)
 
         bool read_fail = false;
         for (int i = 0; i < MOTOR_COUNT; i++) {
-            float current_deg = 0.0f;
-            esp_err_t angle_err = mt6816_read_angle_deg_dev(&enc, i + 1, &current_deg);
-            if (angle_err != ESP_OK) {
+            if (snapshot.err[i] != ESP_OK || isnan(snapshot.angle_deg[i])) {
                 #ifdef DEBUG
-                ESP_LOGW(GATTC_TAG, "MT6816[%d] read failed: %s", i + 1, esp_err_to_name(angle_err));
+                ESP_LOGW(GATTC_TAG, "MT6816[%d] read failed: %s", i + 1, esp_err_to_name(snapshot.err[i]));
                 #endif
                 read_fail = true;
                 continue;
             }
 
-            g_motors[i].current_deg = current_deg;
-            g_motors[i].target_deg = targets[i];
-
-            const float err_deg = angle_error_deg(targets[i], current_deg);
-            g_motors[i].err_deg = err_deg;
-            const float abs_err_deg = (err_deg >= 0.0f) ? err_deg : -err_deg;
-
-            uint32_t pwm = 0;
-            uint8_t dir = 1;
-            if (abs_err_deg >= ANGLE_CTRL_DEADBAND_DEG) {
-                float duty_f = abs_err_deg * ANGLE_CTRL_KP_DUTY_PER_DEG;
-                if (duty_f > (float)MOTOR_PWM_MAX_DUTY) {
-                    duty_f = (float)MOTOR_PWM_MAX_DUTY;
-                }
-                pwm = (uint32_t)duty_f;
-                dir = (err_deg >= 0.0f) ? 1 : 2;
-            }
-
-            motor_apply_pwm_by_index(i, pwm, dir);
+            motor_pid_move_to_angle(i, targets[i], snapshot.angle_deg[i], loop_dt_s);
         }
-
         if (read_fail) {
             motor_stop_all();
             vTaskDelay(loop_ticks);
             continue;
         }
 
+
+// 
         if ((now_us - last_log_us) >= ANGLE_CTRL_LOG_PERIOD_US) {
             last_log_us = now_us;
-            ESP_LOGI(GATTC_TAG,
-                     "ANGLE tgt=[%.1f %.1f %.1f %.1f] cur=[%.1f %.1f %.1f %.1f] err=[%.1f %.1f %.1f %.1f] flags=0x%02X",
-                     g_motors[0].target_deg, g_motors[1].target_deg, g_motors[2].target_deg, g_motors[3].target_deg,
-                     g_motors[0].current_deg, g_motors[1].current_deg, g_motors[2].current_deg, g_motors[3].current_deg,
-                     g_motors[0].err_deg, g_motors[1].err_deg, g_motors[2].err_deg, g_motors[3].err_deg,
-                     active_cmd.flags);
+        
         }
 
         vTaskDelay(loop_ticks);
@@ -1293,6 +1462,8 @@ void app_main(void)
     /*-----------------------------------------------------------------*/
     gpio_init();
     motor_stop_all();
+    pid_init_defaults();
+    speed_profile_init_defaults();
 
 #ifdef MT6816_ON
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
@@ -1308,6 +1479,12 @@ void app_main(void)
     ESP_LOGW(GATTC_TAG, "MT6816_ON not defined, angle closed-loop disabled");
 #endif
 
+    g_encoder_queue = xQueueCreate(ENCODER_QUEUE_LEN, sizeof(encoder_snapshot_t));
+    if (g_encoder_queue == NULL) {
+        ESP_LOGE(GATTC_TAG, "Create encoder queue failed");
+        return;
+    }
+
     rc_rx_queue = xQueueCreate(RC_RX_QUEUE_LEN, sizeof(rc_rx_packet_t));
     rc_ctrl_queue = xQueueCreate(RC_CTRL_QUEUE_LEN, sizeof(rc_cmd_t));
     if (rc_rx_queue == NULL || rc_ctrl_queue == NULL) {
@@ -1316,8 +1493,9 @@ void app_main(void)
     }
     g_last_rx_us = esp_timer_get_time();
 
+    xTaskCreate(encoder_read_task, "encoder_task", 3072, NULL, ENCODER_TASK_PRIORITY, NULL);
     xTaskCreate(rc_parse_task, "rc_parse_task", 3072, NULL, 9, NULL);
-    xTaskCreate(rc_control_task, "rc_ctrl_task", 4096, NULL, 8, NULL); // bumped stack to avoid overflow in angle control loop
+    xTaskCreate(rc_control_task, "rc_ctrl_task", 4096, NULL,12, NULL); // bumped stack to avoid overflow in angle control loop
     /*------------------------------------------------------------------*/
 
     spp_uart_init();
