@@ -10,15 +10,17 @@ extern "C" {
 
 
 #define MT6816_ON
-#define PIN_NUM_MISO  18
+#define PIN_NUM_MISO  15
 #define PIN_NUM_MISO2  6
+#define PIN_NUM_MISO3  17
+#define PIN_NUM_MISO4  8
 #define PIN_NUM_MOSI  5
 #define PIN_NUM_CLK   7
 
-#define PIN_NUM_CS1   15
+#define PIN_NUM_CS1   18
 // #define PIN_NUM_CS2   6
-#define PIN_NUM_CS3   17
-#define PIN_NUM_CS4   8
+// #define PIN_NUM_CS3   17
+// #define PIN_NUM_CS4   8
 
 extern spi_bus_config_t buscfg; // Moved definition to source file
 extern spi_bus_config_t buscfg2; // Second bus for alternative MISO

@@ -34,6 +34,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
+#include "driver/gpio.h"
 
 #define DEBUG
 /*--------------------------------------*/
@@ -41,21 +43,29 @@
 
 #define MT6816_ON
 
-#define MT6816_CS1_PIN GPIO_NUM_15
+#define MT6816_CS1_PIN 18
 // #define MT6816_CS2_PIN GPIO_NUM_6
-#define MT6816_CS3_PIN GPIO_NUM_17
-#define MT6816_CS4_PIN GPIO_NUM_8
+// #define MT6816_CS3_PIN GPIO_NUM_17
+// #define MT6816_CS4_PIN GPIO_NUM_8
 
-#define MT6816_MISO_PIN GPIO_NUM_18
-#define MT6816_MISO2_PIN GPIO_NUM_6 // repurposed from CS2
-#define MT6816_MOSI_PIN GPIO_NUM_5
-#define MT6816_SCK_PIN GPIO_NUM_7
+#define MT6816_MISO_PIN 15
+#define MT6816_MISO2_PIN 6 // repurposed from CS2
+#define MT6816_MISO3_PIN 17 // repurposed from CS3
+#define MT6816_MISO4_PIN 8  // repurposed from CS4
+#define MT6816_MOSI_PIN 5
+#define MT6816_SCK_PIN 7
+
+你static const int k_mt6816_miso_pins[4] = {
+    MT6816_MISO_PIN,
+    MT6816_MISO2_PIN,
+    MT6816_MISO3_PIN,
+    MT6816_MISO4_PIN,
+};
 
 // Dual-encoder mode: keep both MISO inputs enabled simultaneously.
 #define MT6816_DUAL_ENCODER 1
 /*--------------------------------------*/
 #include "driver/ledc.h"
-#include "driver/gpio.h"
 
 #define _1_PWMA GPIO_NUM_10
 #define _1_AIN2 GPIO_NUM_11
@@ -693,6 +703,38 @@ static void motor_pid_move_to_angle(int motor_idx, float target_deg, float curre
     motor_apply_pwm_by_index(motor_idx, (uint32_t)pwm_f, dir);
 }
 
+static esp_err_t mt6816_read_angle_deg_switched(mt6816_t *dev, int miso_gpio, float *angle_deg)
+{
+    if (!dev || !angle_deg) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = mt6816_select_miso(dev, miso_gpio);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    // Let GPIO-matrix input path settle after MISO reroute.
+    esp_rom_delay_us(6);
+
+    // Warm-up read: discard one frame after switching MISO to reduce stale edge effects.
+    float throwaway = 0.0f;
+    (void)mt6816_read_angle_deg(dev, &throwaway);
+
+    for (int retry = 0; retry < 3; retry++) {
+        err = mt6816_read_angle_deg(dev, angle_deg);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+        if (err != ESP_ERR_INVALID_CRC) {
+            return err;
+        }
+        esp_rom_delay_us(6);
+    }
+
+    return err;
+}
+
 // 独立的编码器采样任务，周期读取四个MT6816角度并缓存最新快照
 // arg：未使用
 static void encoder_read_task(void *arg)
@@ -714,16 +756,8 @@ static void encoder_read_task(void *arg)
             float angle = 0.0f;
             esp_err_t err = ESP_ERR_INVALID_ARG;
 
-            if (i == 0) {
-                err = mt6816_select_miso(&enc, MT6816_MISO_PIN);
-                if (err == ESP_OK) {
-                err = mt6816_read_angle_deg(&enc, &angle);
-                }
-            } else if (i == 1) {
-                err = mt6816_select_miso(&enc, MT6816_MISO2_PIN);
-                if (err == ESP_OK) {
-                    err = mt6816_read_angle_deg(&enc, &angle);
-                }
+            if (i < (int)(sizeof(k_mt6816_miso_pins) / sizeof(k_mt6816_miso_pins[0]))) {
+                err = mt6816_read_angle_deg_switched(&enc, k_mt6816_miso_pins[i], &angle);
             }
 
             snapshot.err[i] = err;
@@ -1517,7 +1551,8 @@ void app_main(void)
     }
 
     g_mt6816_ready = true;
-    ESP_LOGI(GATTC_TAG, "MT6816 single-host init OK, cs=%d miso1=%d miso2=%d", MT6816_CS1_PIN, MT6816_MISO_PIN, MT6816_MISO2_PIN);
+    ESP_LOGI(GATTC_TAG, "MT6816 single-host init OK, cs=%d miso=[%d,%d,%d,%d]",
+             MT6816_CS1_PIN, MT6816_MISO_PIN, MT6816_MISO2_PIN, MT6816_MISO3_PIN, MT6816_MISO4_PIN);
 #else
     ESP_LOGW(GATTC_TAG, "MT6816_ON not defined, angle closed-loop disabled");
 #endif
