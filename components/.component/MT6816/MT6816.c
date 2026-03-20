@@ -3,6 +3,9 @@
 #include "esp_log.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "esp_rom_sys.h"
+#include "esp_rom_gpio.h"
+#include "soc/spi_periph.h"
 #include <string.h>
 #include <stdbool.h>
 
@@ -21,7 +24,17 @@ spi_bus_config_t buscfg = {
     .max_transfer_sz = 2,
 };
 
+spi_bus_config_t buscfg2 = {
+    .miso_io_num = PIN_NUM_MISO2,
+    .mosi_io_num = PIN_NUM_MOSI,
+    .sclk_io_num = PIN_NUM_CLK,
+    .quadwp_io_num = -1,
+    .quadhd_io_num = -1,
+    .max_transfer_sz = 2,
+};
+
 mt6816_t enc = {0};
+mt6816_t enc2 = {0};
 
 static void mt6816_log_idle_levels(int active_cs_gpio)
 {
@@ -42,35 +55,38 @@ static void mt6816_log_idle_levels(int active_cs_gpio)
 
 static inline void mt6816_set_other_cs_high(int active_cs_gpio)
 {
-    if (PIN_NUM_CS1 >= 0 && PIN_NUM_CS1 != active_cs_gpio) {
-        gpio_set_level((gpio_num_t)PIN_NUM_CS1, 1);
-    }
-    if (PIN_NUM_CS2 >= 0 && PIN_NUM_CS2 != active_cs_gpio) {
-        gpio_set_level((gpio_num_t)PIN_NUM_CS2, 1);
-    }
-    if (PIN_NUM_CS3 >= 0 && PIN_NUM_CS3 != active_cs_gpio) {
-        gpio_set_level((gpio_num_t)PIN_NUM_CS3, 1);
-    }
-    if (PIN_NUM_CS4 >= 0 && PIN_NUM_CS4 != active_cs_gpio) {
-        gpio_set_level((gpio_num_t)PIN_NUM_CS4, 1);
-    }
+    // Kept for compatibility; no toggling when only a single CS is wired.
+    (void)active_cs_gpio;
 }
 
-static inline int mt6816_cs_from_index(int dev_index)
+static esp_err_t mt6816_route_miso_input(mt6816_t *dev, int miso_gpio)
 {
-    switch (dev_index) {
-    case 1:
-        return PIN_NUM_CS1;
-    case 2:
-        return PIN_NUM_CS2;
-    case 3:
-        return PIN_NUM_CS3;
-    case 4:
-        return PIN_NUM_CS4;
-    default:
-        return -1;
-    }
+    if (!dev || miso_gpio < 0) return ESP_ERR_INVALID_ARG;
+
+    int signal_idx = (int)spi_periph_signal[dev->host].spiq_in;
+    if (signal_idx < 0) return ESP_ERR_NOT_SUPPORTED;
+
+    esp_rom_gpio_connect_in_signal(miso_gpio, signal_idx, false);
+
+    dev->miso_gpio = miso_gpio;
+    return ESP_OK;
 }
+
+// static inline int mt6816_cs_from_index(int dev_index)
+// {
+//     switch (dev_index) {
+//     case 1:
+//         return PIN_NUM_CS1;
+//     case 2:
+//         return PIN_NUM_CS2;
+//     case 3:
+//         return PIN_NUM_CS3;
+//     case 4:
+//         return PIN_NUM_CS4;
+//     default:
+//         return -1;
+//     }
+// }
 
 static inline void mt6816_config_cs_pin(int gpio)
 {
@@ -79,11 +95,13 @@ static inline void mt6816_config_cs_pin(int gpio)
     gpio_config_t conf = {
         .pin_bit_mask = (1ULL << gpio),
         .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&conf));
+    // Bump drive to最大档，避免多个CS并行接线时下拉不干净
+    (void)gpio_set_drive_capability((gpio_num_t)gpio, GPIO_DRIVE_CAP_3);
     gpio_set_level((gpio_num_t)gpio, 1);
 }
 
@@ -127,8 +145,11 @@ static esp_err_t mt6816_read_reg8(mt6816_t *dev, uint8_t addr, uint8_t *out)
 
     // Match STM32 flow: manual CS low/high per 16-bit transaction.
     mt6816_set_other_cs_high(dev->cs_gpio);
+    esp_rom_delay_us(10); // 给CS翻转和长线一点稳定时间
     gpio_set_level((gpio_num_t)dev->cs_gpio, 0);
+    esp_rom_delay_us(5); // 给CS翻转和长线一点稳定时间
     esp_err_t err = spi_device_transmit(dev->dev, &t);
+    esp_rom_delay_us(3);
     gpio_set_level((gpio_num_t)dev->cs_gpio, 1);
     mt6816_set_other_cs_high(dev->cs_gpio);
     if (err != ESP_OK) return err;
@@ -148,29 +169,42 @@ static bool mt6816_even_parity16(uint16_t x)
     return ((x & 1u) == 0);
 }
 
-esp_err_t mt6816_init(mt6816_t *out, spi_host_device_t host, int cs_gpio, int clk_hz)
+esp_err_t mt6816_init(mt6816_t *out, spi_host_device_t host, int cs_gpio, int clk_hz, int miso_gpio)
 {
     if (!out) return ESP_ERR_INVALID_ARG;
+    if (miso_gpio < 0) return ESP_ERR_INVALID_ARG;
 
+    out->host = host;
+    out->clk_hz = clk_hz;
     out->cs_gpio = cs_gpio;
-    mt6816_config_cs_pin(PIN_NUM_CS1);
-    mt6816_config_cs_pin(PIN_NUM_CS2);
-    mt6816_config_cs_pin(PIN_NUM_CS3);
-    mt6816_config_cs_pin(PIN_NUM_CS4);
+    out->miso_gpio = -1;
+    mt6816_config_cs_pin(cs_gpio);
+
+    // SPI 时钟/数据脚加强驱动，SCK 上拉保持空闲高电平
+    (void)gpio_set_drive_capability((gpio_num_t)PIN_NUM_CLK, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_pull_mode((gpio_num_t)PIN_NUM_CLK, GPIO_PULLUP_ONLY); // SCK idle高
+    (void)gpio_set_drive_capability((gpio_num_t)PIN_NUM_MOSI, GPIO_DRIVE_CAP_3);
+
+    // 显式把 MISO 设为输入并上拉，避免悬空时只有几百 mV
+    gpio_config_t miso_cfg = {
+        .pin_bit_mask = (1ULL << miso_gpio),
+        .mode = GPIO_MODE_INPUT, // 开漏输出，外部有上拉时才有效
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&miso_cfg));
 
     mt6816_set_other_cs_high(cs_gpio);
 
     mt6816_log_idle_levels(cs_gpio);
 
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = clk_hz,   // 建议先 100k~500k，稳定后再升
-        .mode = 3,                  // Try mode-1 first (valid range is 0..3)
-        .spics_io_num = -1,         // Use software-controlled CS to match STM32 behavior
+        .clock_speed_hz = clk_hz,
+        .mode = 3,
+        .spics_io_num = -1,
         .queue_size = 1,
         .flags = 0,
-        // 如果你线比较长/模块慢，可加一点 CS 前后延时（单位：SPI bit 周期）
-        // .cs_ena_pretrans = 1,
-        // .cs_ena_posttrans = 1,
     };
 
     spi_device_handle_t dev = NULL;
@@ -179,9 +213,29 @@ esp_err_t mt6816_init(mt6816_t *out, spi_host_device_t host, int cs_gpio, int cl
 
     out->dev = dev;
 
+    err = mt6816_route_miso_input(out, miso_gpio);
+    if (err != ESP_OK) return err;
+
     mt6816_log_idle_levels(cs_gpio);
 
     return ESP_OK;
+}
+
+esp_err_t mt6816_select_miso(mt6816_t *dev, int miso_gpio)
+{
+    if (!dev || miso_gpio < 0) return ESP_ERR_INVALID_ARG;
+    if (dev->miso_gpio == miso_gpio) return ESP_OK;
+
+    gpio_config_t miso_cfg = {
+        .pin_bit_mask = (1ULL << miso_gpio),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&miso_cfg));
+
+    return mt6816_route_miso_input(dev, miso_gpio);
 }
 
 esp_err_t mt6816_read_angle14(mt6816_t *dev, uint16_t *angle14)
@@ -237,18 +291,18 @@ esp_err_t mt6816_read_angle_deg(mt6816_t *dev, float *angle_deg)
     return ESP_OK;
 }
 
-esp_err_t mt6816_read_angle_deg_dev(mt6816_t *dev, int dev_index, float *angle_deg)
-{
-    if (!dev || !angle_deg) return ESP_ERR_INVALID_ARG;
+// esp_err_t mt6816_read_angle_deg_dev(mt6816_t *dev, int dev_index, float *angle_deg)
+// {
+//     if (!dev || !angle_deg) return ESP_ERR_INVALID_ARG;
 
-    int cs_gpio = mt6816_cs_from_index(dev_index);
-    if (cs_gpio < 0) return ESP_ERR_INVALID_ARG;
+//     int cs_gpio = mt6816_cs_from_index(dev_index);
+//     if (cs_gpio < 0) return ESP_ERR_INVALID_ARG;
 
-    int prev_cs = dev->cs_gpio;
-    dev->cs_gpio = cs_gpio;
+//     int prev_cs = dev->cs_gpio;
+//     dev->cs_gpio = cs_gpio;
 
-    esp_err_t err = mt6816_read_angle_deg(dev, angle_deg);
+//     esp_err_t err = mt6816_read_angle_deg(dev, angle_deg);
 
-    dev->cs_gpio = prev_cs;
-    return err;
-}
+//     dev->cs_gpio = prev_cs;
+//     return err;
+// }

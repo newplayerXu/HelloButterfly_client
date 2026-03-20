@@ -42,13 +42,17 @@
 #define MT6816_ON
 
 #define MT6816_CS1_PIN GPIO_NUM_15
-#define MT6816_CS2_PIN GPIO_NUM_6
+// #define MT6816_CS2_PIN GPIO_NUM_6
 #define MT6816_CS3_PIN GPIO_NUM_17
 #define MT6816_CS4_PIN GPIO_NUM_8
 
 #define MT6816_MISO_PIN GPIO_NUM_18
+#define MT6816_MISO2_PIN GPIO_NUM_6 // repurposed from CS2
 #define MT6816_MOSI_PIN GPIO_NUM_5
 #define MT6816_SCK_PIN GPIO_NUM_7
+
+// Dual-encoder mode: keep both MISO inputs enabled simultaneously.
+#define MT6816_DUAL_ENCODER 1
 /*--------------------------------------*/
 #include "driver/ledc.h"
 #include "driver/gpio.h"
@@ -708,11 +712,28 @@ static void encoder_read_task(void *arg)
 
         for (int i = 0; i < MOTOR_COUNT; i++) {
             float angle = 0.0f;
-            esp_err_t err = mt6816_read_angle_deg_dev(&enc, i + 1, &angle);
+            esp_err_t err = ESP_ERR_INVALID_ARG;
+
+            if (i == 0) {
+                err = mt6816_select_miso(&enc, MT6816_MISO_PIN);
+                if (err == ESP_OK) {
+                err = mt6816_read_angle_deg(&enc, &angle);
+                }
+            } else if (i == 1) {
+                err = mt6816_select_miso(&enc, MT6816_MISO2_PIN);
+                if (err == ESP_OK) {
+                    err = mt6816_read_angle_deg(&enc, &angle);
+                }
+            }
+
             snapshot.err[i] = err;
             snapshot.angle_deg[i] = (err == ESP_OK) ? angle : NAN;
         }
-
+        // float angle = 0.0f;
+        // mt6816_read_angle_deg_dev(&enc,1, &angle);
+        // gpio_set_level(GPIO_NUM_18,1);
+        // vTaskDelay(100 / portTICK_PERIOD_MS);
+        // gpio_set_level(GPIO_NUM_18,0);
         g_encoder_latest = snapshot;
         if (g_encoder_queue != NULL) {
             (void)xQueueOverwrite(g_encoder_queue, &snapshot);
@@ -849,6 +870,11 @@ static void rc_control_task(void *arg)
             vTaskDelay(loop_ticks);
             continue;
         }
+        if (snapshot.timestamp_us == 0) {
+            motor_stop_all();
+            vTaskDelay(loop_ticks);
+            continue;
+        }
         if ((now_us - snapshot.timestamp_us) > ENCODER_STALE_TIMEOUT_US) {
             motor_stop_all();
             vTaskDelay(loop_ticks);
@@ -897,7 +923,11 @@ static void rc_control_task(void *arg)
 // 
         if ((now_us - last_log_us) >= ANGLE_CTRL_LOG_PERIOD_US) {
             last_log_us = now_us;
-        
+            ESP_LOGI(GATTC_TAG, "ENC ts=%llu ang=[%.1f %.1f %.1f %.1f] tgt=[%.1f %.1f %.1f %.1f] err=[%.1f %.1f %.1f %.1f]",
+                     (unsigned long long)snapshot.timestamp_us,
+                     snapshot.angle_deg[0], snapshot.angle_deg[1], snapshot.angle_deg[2], snapshot.angle_deg[3],
+                     targets[0], targets[1], targets[2], targets[3],
+                     g_motors[0].err_deg, g_motors[1].err_deg, g_motors[2].err_deg, g_motors[3].err_deg);
         }
 
         vTaskDelay(loop_ticks);
@@ -1478,15 +1508,16 @@ void app_main(void)
     speed_profile_init_defaults();
 
 #ifdef MT6816_ON
+    // Single-host mode: one SPI host, switch MISO pin before each encoder read.
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    ret = mt6816_init(&enc, SPI2_HOST, MT6816_CS1_PIN, 100 * 1000);
-    if (ret == ESP_OK) {
-        g_mt6816_ready = true;
-        ESP_LOGI(GATTC_TAG, "MT6816 init OK");
-    } else {
-        ESP_LOGE(GATTC_TAG, "MT6816 init failed: %s", esp_err_to_name(ret));
+    ret = mt6816_init(&enc, SPI2_HOST, MT6816_CS1_PIN, 1 * 1000, MT6816_MISO_PIN);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTC_TAG, "MT6816#1 init failed: %s", esp_err_to_name(ret));
         return;
     }
+
+    g_mt6816_ready = true;
+    ESP_LOGI(GATTC_TAG, "MT6816 single-host init OK, cs=%d miso1=%d miso2=%d", MT6816_CS1_PIN, MT6816_MISO_PIN, MT6816_MISO2_PIN);
 #else
     ESP_LOGW(GATTC_TAG, "MT6816_ON not defined, angle closed-loop disabled");
 #endif
@@ -1505,8 +1536,8 @@ void app_main(void)
     }
     g_last_rx_us = esp_timer_get_time();
 
-    xTaskCreate(encoder_read_task, "encoder_task", 3072, NULL, ENCODER_TASK_PRIORITY, NULL);
-    xTaskCreate(rc_parse_task, "rc_parse_task", 3072, NULL, 9, NULL);
+    xTaskCreate(encoder_read_task, "encoder_task", 4096*2, NULL, ENCODER_TASK_PRIORITY, NULL);
+    xTaskCreate(rc_parse_task, "rc_parse_task", 4096, NULL, 9, NULL);
     xTaskCreate(rc_control_task, "rc_ctrl_task", 4096, NULL,12, NULL); // bumped stack to avoid overflow in angle control loop
     /*------------------------------------------------------------------*/
 
