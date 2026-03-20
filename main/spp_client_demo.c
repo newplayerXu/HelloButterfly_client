@@ -55,7 +55,7 @@
 #define MT6816_MOSI_PIN 5
 #define MT6816_SCK_PIN 7
 
-你static const int k_mt6816_miso_pins[4] = {
+static const int k_mt6816_miso_pins[4] = {
     MT6816_MISO_PIN,
     MT6816_MISO2_PIN,
     MT6816_MISO3_PIN,
